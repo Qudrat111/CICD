@@ -1,53 +1,126 @@
-name: Java CI/CD
+# name: Java CI/CD
+
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       environment:
+#         description: "Select environment"
+#         type: choice
+#         required: true
+#         options:
+#           - dev
+#           - staging
+#           - prod
+#         default: dev
+
+#       deploy:
+#         description: "Deploy after build?"
+#         type: boolean
+#         required: true
+#         default: false
+
+# jobs:
+#   build:
+#     runs-on: ubuntu-latest
+
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v4
+
+#       - name: Set up Java
+#         uses: actions/setup-java@v4
+#         with:
+#           distribution: temurin
+#           java-version: '17'
+
+#       - name: Build with Maven
+#         run: mvn -B clean install --no-transfer-progress
+
+#       - name: Run tests
+#         run: mvn test
+
+#       - name: Show selected options
+#         run: |
+#           echo "Environment chosen: ${{ github.event.inputs.environment }}"
+#           echo "Deploy? ${{ github.event.inputs.deploy }}"
+
+#       - name: Deploy (only if checkbox = true)
+#         if: ${{ github.event.inputs.deploy == 'true' }}
+#         run: |
+#           echo "Deploying to environment: ${{ github.event.inputs.environment }}"
+#           # your deploy commands here
+#           # example:
+#           # scp target/app.jar user@server:/deploy/path/
+
+
+
+
+name: Build & Push Image to GHCR
 
 on:
   workflow_dispatch:
     inputs:
+      repository:
+        description: "Repository name (org/repo)"
+        required: true
       environment:
-        description: "Select environment"
-        type: choice
+        description: "Environment (dev / staging / prod)"
         required: true
-        options:
-          - dev
-          - staging
-          - prod
-        default: dev
 
-      deploy:
-        description: "Deploy after build?"
-        type: boolean
-        required: true
-        default: false
+permissions:
+  contents: read
+  packages: write   # REQUIRED to push to GHCR
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
 
     steps:
+      # 1️⃣ Checkout source code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      # 2️⃣ Parse repository name (org/repo → repo)
+      - name: Parse repository name only
+        id: parse-repository-name
+        run: |
+          REPO="${{ github.event.inputs.repository }}"
+          echo "REPOSITORY_NAME=$(echo "$REPO" | awk -F'/' '{print $NF}')" >> $GITHUB_OUTPUT
+
+      # 3️⃣ Get commit SHA
+      - name: Get checked out commit SHA
+        id: repo-sha
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      # 4️⃣ 🔐 LOGIN TO GITHUB CONTAINER REGISTRY
+      # WHY: Docker must be authenticated BEFORE push
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          distribution: temurin
-          java-version: '17'
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build with Maven
-        run: mvn -B clean install --no-transfer-progress
+      # 5️⃣ Build & push Docker image
+      - name: Build and push image to GitHub Container Registry
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ghcr.io/yourrepo/${{ steps.parse-repository-name.outputs.REPOSITORY_NAME }}:${{ github.event.inputs.environment }}-${{ steps.repo-sha.outputs.sha }}
 
-      - name: Run tests
-        run: mvn test
-
-      - name: Show selected options
+      # 6️⃣ Update Helm / values file
+      - name: Update image repository and tag in values file
         run: |
-          echo "Environment chosen: ${{ github.event.inputs.environment }}"
-          echo "Deploy? ${{ github.event.inputs.deploy }}"
+          FILE="values.yaml"
+          REPO_NAME="${{ steps.parse-repository-name.outputs.REPOSITORY_NAME }}"
+          TAG="${{ github.event.inputs.environment }}-${{ steps.repo-sha.outputs.sha }}"
 
-      - name: Deploy (only if checkbox = true)
-        if: ${{ github.event.inputs.deploy == 'true' }}
-        run: |
-          echo "Deploying to environment: ${{ github.event.inputs.environment }}"
-          # your deploy commands here
-          # example:
-          # scp target/app.jar user@server:/deploy/path/
+          sed -i.bak -E 's|^([[:space:]]*registry:[[:space:]]*).*$|\1ghcr.io|' "$FILE"
+          sed -i.bak -E "s|^([[:space:]]*repository:[[:space:]]*).*$|\1yourrepo/$REPO_NAME|" "$FILE"
+          sed -i.bak -E "s|^([[:space:]]*tag:[[:space:]]*).*$|\1\"$TAG\"|" "$FILE"
+          rm -f "${FILE}.bak"
+
